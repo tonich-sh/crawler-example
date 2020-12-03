@@ -1,0 +1,12 @@
+
+How to run
+
+pipenv install
+
+# change celery settings in tasks.py and start celery
+pipenv run celery -A tasks worker
+
+# start web
+pipenv run python web.py
+
+# open http://127.0.0.1:5000/ in browser
