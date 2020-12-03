@@ -1,14 +1,16 @@
 
 import os
+import sys
 import cgi
 import asyncio
 import aiohttp
 import tempfile
 import mimetypes
 import tarfile
+import logging
 
 
-from typing import Union
+from typing import Union, Generator
 from collections import namedtuple, deque
 from urllib.parse import urlparse, urlunparse
 
@@ -16,9 +18,9 @@ from bs4 import BeautifulSoup
 from celery import Celery
 
 
-app = Celery(__name__, backend='rpc://', broker='amqp://parse:123456@exc/')
+app = Celery(__name__, backend='rpc://', broker='amqp://parse:123456@rabbitmq/')
 
-BASE_PATH = os.path.join(os.path.abspath(__file__), 'data')
+BASE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data')
 CONCURRENCY_LIMIT = 5
 MAX_LEVEL = 2
 TMP_DIR = os.path.join(BASE_PATH, 'tmp')
@@ -28,43 +30,61 @@ STATIC_BASE = 'http://localhost:5000/static/'
 DownloadJob = namedtuple('DownloadJob', ['url', 'level'])
 DownloadResult = namedtuple('DownloadResult', ['dj', 'data', 'mime', 'options'])
 
+logger = logging.getLogger(__name__)
 
-def extract(dr: DownloadResult):
+
+def extract(dr: DownloadResult) -> Generator[DownloadJob, None, None]:
 
     if dr.mime != 'text/html':
         return
 
     base_url = urlparse(dr.dj.url)
 
-    def prepare_link(link):
+    def prepare_link(link) -> Union[DownloadJob, None]:
+        if not link:
+            return
         parsed_link = urlparse(link)
         if not parsed_link.netloc:
             u = [base_url.scheme, base_url.netloc] + list(parsed_link)[2:]
-            return DownloadJob(urlunparse(u), dr.dj.level + 1)
+            try:
+                return DownloadJob(urlunparse(u), dr.dj.level + 1)
+            except:
+                print('error on url "{}", "{}"'.format(link, u))
         if parsed_link.netloc == base_url.netloc:
             return DownloadJob(parsed_link.geturl(), dr.dj.level + 1)
 
     soup = BeautifulSoup(dr.data, 'html.parser')
-    for el in soup.find_all('a'):
-        href = prepare_link(el.attrs.get('href', None))
-        if href:
-            yield href
+    links = [
+        ('a', 'href'),
+        ('link', 'href'),
+        ('script', 'src'),
+        ('img', 'src')
+    ]
+    for name, attr in links:
+        for el in soup.find_all(name):
+            href = prepare_link(el.attrs.get(attr, None))
+            if href:
+                yield href
 
 
 async def fetch(dj: DownloadJob) -> Union[DownloadResult, None]:
     async with aiohttp.ClientSession() as session:
-        print('start {}'.format(dj.url))
+        logger.info('start {}'.format(dj.url))
         async with session.get(dj.url) as resp:
             if resp.status == 200:
                 content_type = resp.headers.get('content-type')
                 mime, options = cgi.parse_header(content_type)
-                print('done {}'.format(dj.url))
-                return DownloadResult(dj, await resp.text(), mime, options)
+                logger.info('done {}'.format(dj.url))
+                if mime.startswith('text'):
+                    data = await resp.text()
+                else:
+                    data = await resp.read()
+                return DownloadResult(dj, data, mime, options)
 
 
 def save_data(dr: DownloadResult, path: str):
     parsed_link = urlparse(dr.dj.url)
-    store_path = os.path.join(path, *parsed_link.path.split('/'))
+    store_path = os.path.join(path, parsed_link.netloc, *parsed_link.path.split('/'))
 
     if store_path.endswith('/'):
         store_path = os.path.join(store_path, 'index.html')
@@ -82,15 +102,18 @@ def save_data(dr: DownloadResult, path: str):
     store_dir = os.path.dirname(store_path)
     if not os.path.exists(store_dir):
         os.makedirs(store_dir)
-
-    with open(store_path, 'w') as f:
+    if isinstance(dr.data, str):
+        mode = 'w'
+    else:
+        mode = 'wb'
+    with open(store_path, mode) as f:
         f.write(dr.data)
 
 
 def make_tar(tar_file: str, path: str):
 
     def filter1(tarinfo: tarfile.TarInfo):
-        tarinfo.name = tarinfo.name[len(path) + 1:]
+        tarinfo.name = tarinfo.name[len(path):]
         return tarinfo
 
     tar = tarfile.open(tar_file, mode='w:gz')
@@ -114,7 +137,8 @@ async def download(url: str, path: str, id: str):
             for f in done:
                 result = await f
                 if isinstance(result, DownloadResult):
-                    links.extend(list(extract(result)))
+                    if result.mime == 'text/html':
+                        links.extend(list(extract(result)))
                     save_data(result, path)
 
         tasks = [task for task in tasks if not task.done()]
@@ -141,13 +165,13 @@ async def download(url: str, path: str, id: str):
 
 @app.task
 def do_parse(url):
-    print('start crawling of "{}" in task {}'.format(url, do_parse.request.id))
+    logger.info('start crawling of "{}" in task {}'.format(url, do_parse.request.id))
     path = tempfile.mkdtemp(dir=TMP_DIR)
-    print('files will be placed into "{}"'.format(path))
-    asyncio.run(download(url, path, do_parse.request.id))
+    logger.info('files will be placed into "{}"'.format(path))
+    return asyncio.run(download(url, path, do_parse.request.id))
 
 
 if __name__ == '__main__':
-    # asyncio.run(download('http://quotes.toscrape.com/', '/tmp/parse1', '001'))
-    # make_tar('/tmp/test.tar.gz', '/tmp/parse1')
-    pass
+    asyncio.run(download('http://quotes.toscrape.com/', '/tmp/parse1', '001'))
+    make_tar('/tmp/test.tar.gz', '/tmp/parse1')
+
